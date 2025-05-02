@@ -1,511 +1,661 @@
 import time
 import numpy as np
-# module load cs909-python
 import os
 import subprocess
-import face_recognition
+import logging
+from pathlib import Path
 import cv2
 from moviepy.video.io.VideoFileClip import VideoFileClip
-import utilities
-import constants
+import face_recognition
+from typing import List, Tuple, Optional, Dict, Any, Union
 import json
 import csv
 import sys
+import yaml
+from tqdm import tqdm
+import concurrent.futures
+
 """
-All preprocessing required for training, testing and classification is carried out by a preprocessing class.
+Preprocessing module for the Thirdeye deepfake detection system.
+Handles all video preprocessing tasks including face detection, cropping, and motion vector extraction.
 """
-class Preprocessor:
 
-    """
-    Initialize Class
-    -----------------------------------------------------------
-    Initialize processing class
-    """
-    def __init__(self):
-        pass
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("thirdeye_preprocessing.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("Preprocessing")
 
-    """
-    Carry out preprocessing
-    -----------------------------------------------------------
-    Primary function to carry out all Preprocessing
-    split: 1 for training, 2 for testing and 3 for unknown splits
-    """
-    def preprocess(self, split):
-        try:
-            if split == 1:
-                self.handle_train_files(1)
-            elif split == 2:
-                self.handle_test_files(2)
-            else:
-                self.handle_unknown_files(3)
-        except:
-            print("Oops!",sys.exc_info()[0],"occured. Ensure files for preprocessing are valid")
-
-    """
-    Get the largest face in a clip to ensure entire face is always visible after cropping
-    -----------------------------------------------------------
-    video: CV2 video object to get largest face from
-    """
-    def get_largest_face_size(self, video):
-        largest_face_height_i = 0
-        largest_face_width_i = 0
-
-        count = 0
-        while True:
-            # Grab a single frame of video
-            ret_init, frame_init = video.read()
-
-            # Quit when the input video file ends
-            if not ret_init:
-                break
-
-            # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
-            rgb_frame_init = frame_init[:, :, ::-1]
-
-            # Find all the faces and face encodings in the current frame of video
-            face_locations_init = face_recognition.face_locations(rgb_frame_init)
-            if face_locations_init:
-                top_i, right_i, bottom_i, left_i = face_locations_init[0]
-
-                height_i = bottom_i-top_i
-                width_i = right_i-left_i
-                if height_i > largest_face_height_i:
-                    largest_face_height_i = height_i
-                if width_i > largest_face_width_i:
-                    largest_face_width_i = width_i
-
-            count += 1
-        return largest_face_width_i, largest_face_height_i
-
-    """
-    Split raw videos into a given number of frames
-    -----------------------------------------------------------
-    Split raw videos into fixed segments of fixed frame enumerate
-    clip size: size of each individual clip
-    file_path: path to raw Videos
-    fps_path: path to store fps standardised Videos
-    output_path: path to store fixed size clips
-    split: which data split is currently been processed (train, test, unknown)
-    """
-    def split_raw_videos(self, clip_size, file_path, fps_path, output_path, split):
-        raw_file_list = os.listdir(file_path)
-        # Filter only new Files
-        old_files = []
-        old_files_path = '{}processed_files_{}.csv'.format(constants.DATA, split)
-        exists = os.path.isfile(old_files_path)
-        if exists:
-            with open(old_files_path, 'r') as f:
-                reader = csv.reader(f)
-                for i in reader:
-                    old_files.append(i[0])
-            new_files = [x for x in raw_file_list if x not in old_files]
+class ConfigManager:
+    """Handle configuration settings for the preprocessing pipeline."""
+    
+    def __init__(self, config_path: str = 'config.yaml'):
+        """
+        Initialize the configuration manager.
+        
+        Args:
+            config_path: Path to the configuration YAML file.
+        """
+        self.config_path = config_path
+        self.config = self._load_config()
+        
+    def _load_config(self) -> Dict[str, Any]:
+        """
+        Load configuration from YAML file, or create default if not found.
+        
+        Returns:
+            Dict containing configuration settings
+        """
+        if os.path.exists(self.config_path):
+            with open(self.config_path, 'r') as file:
+                return yaml.safe_load(file)
         else:
-            new_files = raw_file_list
+            # Default configuration
+            default_config = {
+                'data_paths': {
+                    'base_dir': './Data/',
+                    'figures_dir': './Figures/',
+                    'models_dir': './Saved_Models/',
+                },
+                'preprocessing': {
+                    'face_box_bias': 20,
+                    'face_box_size': 100,
+                    'frames_per_clip': 20,
+                    'fps': 20,
+                    'clip_duration': 1,
+                    'batch_size': 32,
+                },
+                'splits': {
+                    'train': {
+                        'real_raw': './Data/TRAIN/REAL_RAW/',
+                        'deepfake_raw': './Data/TRAIN/DF_RAW/',
+                        'real_fps': './Data/TRAIN/REAL_RAW/FPS/',
+                        'deepfake_fps': './Data/TRAIN/DF_RAW/FPS/',
+                        'real_clips': './Data/TRAIN/REAL_CLIPS/',
+                        'deepfake_clips': './Data/TRAIN/DF_CLIPS/',
+                        'real_faces': './Data/TRAIN/REAL_SAMPLES/',
+                        'deepfake_faces': './Data/TRAIN/DF_SAMPLES/',
+                        'real_mv': './Data/TRAIN/REAL_MV/',
+                        'deepfake_mv': './Data/TRAIN/DF_MV/',
+                    },
+                    'test': {
+                        'real_raw': './Data/TEST/REAL_RAW/',
+                        'deepfake_raw': './Data/TEST/DF_RAW/',
+                        'real_fps': './Data/TEST/REAL_RAW/FPS/',
+                        'deepfake_fps': './Data/TEST/DF_RAW/FPS/',
+                        'real_clips': './Data/TEST/REAL_CLIPS/',
+                        'deepfake_clips': './Data/TEST/DF_CLIPS/',
+                        'real_faces': './Data/TEST/REAL_SAMPLES/',
+                        'deepfake_faces': './Data/TEST/DF_SAMPLES/',
+                        'real_mv': './Data/TEST/REAL_MV/',
+                        'deepfake_mv': './Data/TEST/DF_MV/',
+                    },
+                    'unknown': {
+                        'raw': './Data/UNKNOWN/UNKNOWN_RAW/',
+                        'fps': './Data/UNKNOWN/UNKNOWN_FPS/',
+                        'clips': './Data/UNKNOWN/UNKNOWN_CLIPS/',
+                        'faces': './Data/UNKNOWN/UNKNOWN_SAMPLES/',
+                    }
+                }
+            }
+            
+            # Create directories if they don't exist
+            for split in default_config['splits']:
+                for _, path in default_config['splits'][split].items():
+                    os.makedirs(path, exist_ok=True)
+            
+            # Write default config
+            with open(self.config_path, 'w') as file:
+                yaml.dump(default_config, file)
+            
+            return default_config
+    
+    def get_paths(self, split: str) -> Dict[str, str]:
+        """
+        Get paths for a specific data split.
+        
+        Args:
+            split: The data split ('train', 'test', or 'unknown')
+            
+        Returns:
+            Dictionary of paths for the specified split
+        """
+        return self.config['splits'].get(split, {})
+    
+    def get_preprocessing_params(self) -> Dict[str, Any]:
+        """
+        Get preprocessing parameters.
+        
+        Returns:
+            Dictionary of preprocessing parameters
+        """
+        return self.config['preprocessing']
 
-        # Loop through files in folder
-        for index, filename in enumerate(new_files):
-            # If video file
-            if filename.endswith(".mp4"):
-                video_filetype = "mp4"
 
-
-                command = "ffmpeg -i {} -r 20 -y {}".format(file_path + filename, fps_path + filename)
-                subprocess.call(command, shell=True)
-
-                input_video_path = fps_path + filename
-                # Import video
-                if os.path.isfile(input_video_path):
-                    with VideoFileClip(input_video_path) as video:
-                        # Get video duration and calculate number of possible clips
-                        clip_count = int(video.duration/clip_size)
-                        # Split each clip and save
-                        for clip in range(clip_count):
-                            output_video_path = '{}{}{}{}.{}'.format(output_path, index, len(old_files), clip, video_filetype) #TODO CONVERT HERE
-                            start = clip
-                            end = clip + clip_size
-                            new = video.subclip(start, end)
-                            new.write_videofile(output_video_path, audio=False, codec='libx264')
-                    # Store filename in folder
-                    with open(old_files_path, 'a') as f:
-                        f.write("%s\n" % filename)
-                else:
-                    print('Warning missing file {}'.format(filename))
-            else:
-                print('Warning: Incompatible file {}'.format(filename))
-        print('File split Complete')
-
-    """
-    Crop videos given a bounding box
-    -----------------------------------------------------------
-    file_path: path to clips
-    output_folder: folder to store cropped clips
-    box_bias: extra pixels around face
-    box_size: final size of cropped video
-    frames: number of frames with faces that are required for this to be a valid video
-    """
-    def crop_videos(self, file_path, output_folder, box_bias, box_size, frames):
-        # Loop through files in folder
-        for index, filename in enumerate(os.listdir(file_path)):
-            # If video file
-            if filename.endswith(".mp4"):
-                self.facial_extraction(file_path, filename, output_folder, box_bias, box_size, frames)
-
-    """
-    Detect and crop faces from clips
-    -----------------------------------------------------------
-    folder: path to clips
-    file_name: video filename
-    output_folder: folder to store cropped clips
-    box_bias: extra pixels around face
-    box_size: final size of cropped video
-    frames: number of frames with faces that are required for this to be a valid video
-    """
-    def facial_extraction(self, folder, file_name, output_folder, box_bias, box_size, frames):
-        print('Dealing with video {}'.format(file_name))
-        input_movie = utilities.init_video(folder + file_name)
-
-        # ffmpeg -y -r 24 -i seeing_noaudio.mp4 seeing.mp4
-
-        length = int(input_movie.get(cv2.CAP_PROP_FRAME_COUNT))
-        # width = int(input_movie.get(cv2.CAP_PROP_FRAME_WIDTH))  # float
-        # height = int(input_movie.get(cv2.CAP_PROP_FRAME_HEIGHT))  # float
-
-        fcc = "mp4v"
+class VideoProcessor:
+    """Process videos for face detection and extraction."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """
+        Initialize the video processor.
+        
+        Args:
+            config_manager: Configuration manager instance
+        """
+        self.config = config_manager
+        self.params = config_manager.get_preprocessing_params()
+    
+    def standardize_fps(self, input_path: str, output_path: str, fps: Optional[int] = None) -> bool:
+        """
+        Standardize the FPS of a video.
+        
+        Args:
+            input_path: Path to the input video
+            output_path: Path to save the processed video
+            fps: Target frames per second (uses config value if None)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if fps is None:
+            fps = self.params['fps']
+        
+        try:
+            command = f"ffmpeg -i {input_path} -r {fps} -y {output_path}"
+            subprocess.run(command, shell=True, check=True, 
+                          stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error standardizing FPS for {input_path}: {e}")
+            return False
+    
+    def get_largest_face_size(self, video_path: str) -> Tuple[int, int]:
+        """
+        Find the largest face dimensions in a video.
+        
+        Args:
+            video_path: Path to the video
+            
+        Returns:
+            Tuple of (width, height) of the largest face
+        """
+        largest_face_height = 0
+        largest_face_width = 0
+        
+        video = cv2.VideoCapture(video_path)
+        
+        try:
+            while True:
+                ret, frame = video.read()
+                if not ret:
+                    break
+                
+                # Convert BGR to RGB for face_recognition
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Find faces
+                face_locations = face_recognition.face_locations(rgb_frame)
+                
+                if face_locations:
+                    top, right, bottom, left = face_locations[0]
+                    height = bottom - top
+                    width = right - left
+                    
+                    largest_face_height = max(largest_face_height, height)
+                    largest_face_width = max(largest_face_width, width)
+        finally:
+            video.release()
+        
+        return largest_face_width, largest_face_height
+    
+    def split_video(self, video_path: str, output_dir: str, 
+                   clip_duration: Optional[int] = None) -> List[str]:
+        """
+        Split a video into clips of specified duration.
+        
+        Args:
+            video_path: Path to the video
+            output_dir: Directory to save the clips
+            clip_duration: Duration of each clip in seconds (uses config value if None)
+            
+        Returns:
+            List of paths to the created clips
+        """
+        if clip_duration is None:
+            clip_duration = self.params['clip_duration']
+        
+        clip_paths = []
+        
+        try:
+            with VideoFileClip(video_path) as video:
+                # Calculate number of clips
+                clip_count = int(video.duration / clip_duration)
+                
+                for i in range(clip_count):
+                    start_time = i * clip_duration
+                    end_time = start_time + clip_duration
+                    
+                    output_path = os.path.join(output_dir, f"{os.path.basename(video_path)}_clip{i}.mp4")
+                    clip = video.subclip(start_time, end_time)
+                    clip.write_videofile(output_path, audio=False, codec='libx264', 
+                                        logger=None, verbose=False)
+                    clip_paths.append(output_path)
+        except Exception as e:
+            logger.error(f"Error splitting video {video_path}: {e}")
+        
+        return clip_paths
+    
+    def extract_face(self, video_path: str, output_path: str, 
+                    box_bias: Optional[int] = None, 
+                    box_size: Optional[int] = None,
+                    min_frames: Optional[int] = None) -> bool:
+        """
+        Extract faces from a video and save to a new video.
+        
+        Args:
+            video_path: Path to the input video
+            output_path: Path to save the processed video
+            box_bias: Extra pixels around the face
+            box_size: Final size of the face box
+            min_frames: Minimum number of frames with faces required
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if box_bias is None:
+            box_bias = self.params['face_box_bias']
+        if box_size is None:
+            box_size = self.params['face_box_size']
+        if min_frames is None:
+            min_frames = self.params['frames_per_clip']
+        
+        # Get video properties
+        input_video = cv2.VideoCapture(video_path)
+        fps = input_video.get(cv2.CAP_PROP_FPS)
+        frame_count = int(input_video.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Find largest face size first
+        largest_face_width, largest_face_height = self.get_largest_face_size(video_path)
+        if largest_face_width == 0 or largest_face_height == 0:
+            logger.warning(f"No faces found in {video_path}")
+            input_video.release()
+            return False
+        
+        # Reset video capture for processing
+        input_video = cv2.VideoCapture(video_path)
+        
+        # Prepare for output video
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-        # Initialize some variables
+        processed_frames = []
         frame_number = 0
-        count = 0
-        largest_face_width, largest_face_height = self.get_largest_face_size(input_movie)
-        frame_list = []
-
-        input_movie = utilities.init_video(folder + file_name)
-
+        
+        # Process each frame
         while True:
-            # Grab a single frame of video
-            ret, frame = input_movie.read()
-            frame_number += 1
-
-            # Quit when the input video file ends
+            ret, frame = input_video.read()
             if not ret:
                 break
-
-            # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
-            rgb_frame = frame[:, :, ::-1]
-
-            # Find all the faces and face encodings in the current frame of video
+            
+            frame_number += 1
+            
+            # Convert to RGB for face detection
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             face_locations = face_recognition.face_locations(rgb_frame)
-            # face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-
+            
             if face_locations:
-                print('Found face in frame {} of video {}.'.format(frame_number, file_name))
+                # Extract the first face
                 top, right, bottom, left = face_locations[0]
-
+                
+                # Adjust to ensure consistent size with largest face
                 if (right - left) < largest_face_width:
-                    right = right + (largest_face_width - (right - left))
-
+                    right = left + largest_face_width
+                
                 if (bottom - top) < largest_face_height:
-                    bottom = bottom + (largest_face_height - (bottom - top))
-
-                frame = frame[top - box_bias:bottom + box_bias, left - box_bias:right + box_bias]
-
+                    bottom = top + largest_face_height
+                
+                # Add bias and crop
                 try:
-                    frame = cv2.resize(frame, (box_size, box_size), interpolation=cv2.INTER_LINEAR)
-                    frame_list = frame_list + [frame]
-
+                    cropped_frame = frame[
+                        max(0, top - box_bias):min(frame.shape[0], bottom + box_bias),
+                        max(0, left - box_bias):min(frame.shape[1], right + box_bias)
+                    ]
+                    
+                    # Resize to standard size
+                    resized_frame = cv2.resize(cropped_frame, (box_size, box_size), 
+                                              interpolation=cv2.INTER_LINEAR)
+                    processed_frames.append(resized_frame)
                 except Exception as e:
-                    print(str(e))
-
+                    logger.warning(f"Error processing frame {frame_number} in {video_path}: {e}")
             else:
-                print('Warning: Frame {} with missing face in video {}'.format(frame_number, file_name))
-
-            # Frames as images?
-            # crop_img = frame[top:bottom, left:right]
-            # cv2.imwrite(TRAIN_SEPARATED_DF_FACES + str(count) + "test.png", crop_img)
-            count += 1
-
-        # Write the resulting frames to the output video file
-        if len(frame_list) == frames:
-            output_movie = cv2.VideoWriter(output_folder + file_name, fourcc, length, (box_size, box_size))
-
-            for f in range(frames):
-                print("Writing frame {} / {}".format(f+1, length))
-                output_movie.write(frame_list[f])
+                logger.debug(f"No face detected in frame {frame_number} of {video_path}")
+        
+        input_video.release()
+        
+        # Check if we have enough frames with faces
+        if len(processed_frames) >= min_frames:
+            # Write to output video
+            output_video = cv2.VideoWriter(output_path, fourcc, fps, (box_size, box_size))
+            for frame in processed_frames:
+                output_video.write(frame)
+            output_video.release()
+            return True
+        elif len(processed_frames) >= min_frames * 0.75:
+            # If we have at least 75% of required frames, duplicate the first frame
+            logger.info(f"Duplicating frames for {video_path} ({len(processed_frames)}/{min_frames})")
+            processed_frames.extend([processed_frames[0]] * (min_frames - len(processed_frames)))
+            
+            output_video = cv2.VideoWriter(output_path, fourcc, fps, (box_size, box_size))
+            for frame in processed_frames:
+                output_video.write(frame)
+            output_video.release()
+            return True
         else:
-            if len(frame_list) >= (frames * 0.75):
-                output_movie = cv2.VideoWriter(output_folder + file_name, fourcc, length, (box_size, box_size))
-
-                print('Duplicating frames for video {}'.format(file_name))
-                frame_list = frame_list + [frame_list[0]] * (frames - len(frame_list))
-                for f in range(frames):
-                    print("Writing frame {} / {}".format(f+1, length))
-                    output_movie.write(frame_list[f])
+            logger.warning(f"Insufficient face frames in {video_path}: {len(processed_frames)}/{min_frames}")
+            return False
+    
+    def extract_motion_vectors(self, video_path: str, output_path: str, 
+                              min_frames: Optional[int] = None) -> bool:
+        """
+        Extract motion vectors from a video and save as CSV.
+        
+        Args:
+            video_path: Path to the input video
+            output_path: Path to save the CSV file
+            min_frames: Minimum number of frames required
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if min_frames is None:
+            min_frames = self.params['frames_per_clip']
+        
+        try:
+            input_video = cv2.VideoCapture(video_path)
+            
+            # Initialize for optical flow
+            ret, frame1 = input_video.read()
+            if not ret:
+                logger.error(f"Could not read video {video_path}")
+                return False
+            
+            prev_frame = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+            hsv = np.zeros_like(frame1)
+            hsv[..., 1] = 255
+            
+            frame_list = []
+            mag_vectors = []
+            
+            # Process each frame
+            while True:
+                ret, frame2 = input_video.read()
+                if not ret:
+                    break
+                
+                next_frame = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+                
+                # Calculate optical flow
+                flow = cv2.calcOpticalFlowFarneback(
+                    prev_frame, next_frame, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                )
+                
+                # Convert to polar coordinates
+                mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                
+                # Visualize flow
+                hsv[..., 0] = ang * 180 / np.pi / 2
+                hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+                rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+                
+                frame_list.append(rgb)
+                mag_vectors.append(mag)
+                
+                # Update for next iteration
+                prev_frame = next_frame
+            
+            input_video.release()
+            
+            # Check if we have enough frames
+            if len(frame_list) == (min_frames - 1):
+                # Save magnitude vectors as CSV
+                with open(output_path, 'w', newline='') as outfile:
+                    writer = csv.writer(outfile, delimiter=',')
+                    for frame_mag in mag_vectors:
+                        writer.writerow(frame_mag.tolist())
+                return True
             else:
-                print('Discarding invalid video {}'.format(file_name))
+                logger.warning(f"Insufficient frames for motion vectors in {video_path}: {len(frame_list)}/{min_frames-1}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error extracting motion vectors from {video_path}: {e}")
+            return False
 
-        # All done!
-        input_movie.release()
-        cv2.destroyAllWindows()
 
+class Preprocessor:
     """
-    Extract motion vectors from clips
-    -----------------------------------------------------------
-    input_folder: folder to cropped videos
-    output_folder: folder to store output csv files
-    frames: number of frames to be a valid video
-    box_size: size of clip
+    Main preprocessing class that orchestrates the entire preprocessing pipeline.
     """
-    def motion_vector_extraction(self, input_folder, output_folder, frames, box_size):
-        # Loop through files in folder
-        for index, filename in enumerate(os.listdir(input_folder)):
-            # If video file
-            if filename.endswith(".mp4"):
-                print('Dealing with video {}'.format(filename))
-                input_movie = utilities.init_video(input_folder + filename)
+    
+    def __init__(self, config_path: str = 'config.yaml'):
+        """
+        Initialize the preprocessor.
+        
+        Args:
+            config_path: Path to the configuration file
+        """
+        self.config_manager = ConfigManager(config_path)
+        self.video_processor = VideoProcessor(self.config_manager)
+        
+        # Create required directories
+        for split in ['train', 'test', 'unknown']:
+            paths = self.config_manager.get_paths(split)
+            for path in paths.values():
+                os.makedirs(path, exist_ok=True)
+    
+    def preprocess(self, split_type: int) -> bool:
+        """
+        Run the preprocessing pipeline.
+        
+        Args:
+            split_type: 1 for training, 2 for testing, 3 for unknown data
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if split_type == 1:
+                logger.info("Preprocessing training data")
+                self._process_training_data()
+            elif split_type == 2:
+                logger.info("Preprocessing testing data")
+                self._process_testing_data()
+            elif split_type == 3:
+                logger.info("Preprocessing unknown data")
+                self._process_unknown_data()
+            else:
+                logger.error(f"Invalid split type: {split_type}")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error during preprocessing: {e}")
+            return False
+    
+    def _process_videos(self, raw_path: str, fps_path: str, clips_path: str, 
+                       faces_path: str, mv_path: str = None) -> None:
+        """
+        Process a set of videos through the entire pipeline.
+        
+        Args:
+            raw_path: Path to raw videos
+            fps_path: Path to store FPS-standardized videos
+            clips_path: Path to store video clips
+            faces_path: Path to store face-extracted videos
+            mv_path: Path to store motion vectors (optional)
+        """
+        # Get processed files to avoid reprocessing
+        processed_files_path = os.path.join(os.path.dirname(raw_path), 'processed_files.csv')
+        processed_files = set()
+        
+        if os.path.exists(processed_files_path):
+            with open(processed_files_path, 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if row:
+                        processed_files.add(row[0])
+        
+        # Get new files to process
+        raw_files = [f for f in os.listdir(raw_path) 
+                    if f.endswith('.mp4') and f not in processed_files]
+        
+        if not raw_files:
+            logger.info(f"No new files to process in {raw_path}")
+            return
+        
+        logger.info(f"Processing {len(raw_files)} new videos from {raw_path}")
+        
+        # Process each file
+        for filename in tqdm(raw_files, desc="Processing videos"):
+            input_path = os.path.join(raw_path, filename)
+            fps_output_path = os.path.join(fps_path, filename)
+            
+            # Standardize FPS
+            if self.video_processor.standardize_fps(input_path, fps_output_path):
+                # Split into clips
+                clip_paths = self.video_processor.split_video(fps_output_path, clips_path)
+                
+                # Process each clip
+                for clip_path in clip_paths:
+                    # Extract faces
+                    face_output_path = os.path.join(faces_path, os.path.basename(clip_path))
+                    if self.video_processor.extract_face(clip_path, face_output_path):
+                        # Extract motion vectors if requested
+                        if mv_path:
+                            mv_output_path = os.path.join(mv_path, f"{os.path.basename(clip_path)}.csv")
+                            self.video_processor.extract_motion_vectors(face_output_path, mv_output_path)
+                
+                # Mark as processed
+                with open(processed_files_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([filename])
+            
+            # Clean up FPS file to save space
+            if os.path.exists(fps_output_path):
+                os.remove(fps_output_path)
+    
+    def _process_training_data(self) -> None:
+        """Process training data (both real and deepfake)."""
+        logger.info("Processing training data - Deepfakes")
+        train_paths = self.config_manager.get_paths('train')
+        
+        self._process_videos(
+            train_paths['deepfake_raw'],
+            train_paths['deepfake_fps'],
+            train_paths['deepfake_clips'],
+            train_paths['deepfake_faces'],
+            train_paths['deepfake_mv']
+        )
+        
+        logger.info("Processing training data - Real")
+        self._process_videos(
+            train_paths['real_raw'],
+            train_paths['real_fps'],
+            train_paths['real_clips'],
+            train_paths['real_faces'],
+            train_paths['real_mv']
+        )
+    
+    def _process_testing_data(self) -> None:
+        """Process testing data (both real and deepfake)."""
+        logger.info("Processing testing data - Deepfakes")
+        test_paths = self.config_manager.get_paths('test')
+        
+        self._process_videos(
+            test_paths['deepfake_raw'],
+            test_paths['deepfake_fps'],
+            test_paths['deepfake_clips'],
+            test_paths['deepfake_faces'],
+            test_paths['deepfake_mv']
+        )
+        
+        logger.info("Processing testing data - Real")
+        self._process_videos(
+            test_paths['real_raw'],
+            test_paths['real_fps'],
+            test_paths['real_clips'],
+            test_paths['real_faces'],
+            test_paths['real_mv']
+        )
+    
+    def _process_unknown_data(self) -> None:
+        """Process unknown data for classification."""
+        logger.info("Processing unknown data for classification")
+        unknown_paths = self.config_manager.get_paths('unknown')
+        
+        self._process_videos(
+            unknown_paths['raw'],
+            unknown_paths['fps'],
+            unknown_paths['clips'],
+            unknown_paths['faces']
+        )
+    
+    def process_single_video(self, video_path: str, output_dir: str) -> str:
+        """
+        Process a single video through the entire pipeline.
+        
+        Args:
+            video_path: Path to the input video
+            output_dir: Directory to save processed outputs
+            
+        Returns:
+            Path to the processed face video
+        """
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        
+        filename = os.path.basename(video_path)
+        fps_path = os.path.join(output_dir, f"fps_{filename}")
+        
+        # Standardize FPS
+        if self.video_processor.standardize_fps(video_path, fps_path):
+            # Split into clips
+            clip_paths = self.video_processor.split_video(fps_path, output_dir)
+            
+            # Process first clip
+            if clip_paths:
+                face_output_path = os.path.join(output_dir, f"face_{filename}")
+                if self.video_processor.extract_face(clip_paths[0], face_output_path):
+                    # Clean up temporary files
+                    os.remove(fps_path)
+                    for clip_path in clip_paths:
+                        os.remove(clip_path)
+                    
+                    return face_output_path
+        
+        logger.error(f"Failed to process video {video_path}")
+        return None
 
-                length = int(input_movie.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                fcc = "mp4v"
-
-                fourcc = cv2.VideoWriter_fourcc(*fcc)
-
-                frame_list = []
-                ang_obj = []
-                mag_obj = []
-
-                ret, frame1 = input_movie.read()
-                prvs = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-                hsv = np.zeros_like(frame1)
-                hsv[..., 1] = 255
-                while (1):
-                    ret, frame2 = input_movie.read()
-
-                    if not ret:
-                        break
-
-                    next = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-
-                    flow = cv2.calcOpticalFlowFarneback(prvs, next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-
-                    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-                    hsv[..., 0] = ang * 180 / np.pi / 2
-                    hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
-                    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-                    # cv2.imshow('frame2', rgb)
-                    # k = cv2.waitKey(30) & 0xff
-                    # print(k)
-                    # if k == 27:
-                    #     break
-                    # elif k == ord('s'):
-                    # cv2.imwrite('opticalfb.png', frame2)
-                    frame_list = frame_list + [rgb]
-                    ang_obj = ang_obj + [ang]
-                    mag_obj = mag_obj + [mag]
-                    # cv2.imwrite('test.png', rgb)
-                    prvs = next
-
-                ang_obj = np.array(ang_obj)
-                mag_obj = np.array(mag_obj)
-
-                mag = mag_obj.tolist()
-                # ang = ang_obj.tolist()
-
-                # Write the resulting frames to the output video file
-                if len(frame_list) == (frames-1):
-                    print("Writing vectors for {}".format(filename))
-                    with open(output_folder + filename + '.csv', "w+") as outfile:
-                        writer = csv.writer(outfile, delimiter=',')
-                        for f in mag:
-                            writer.writerow(f)
-                else:
-                    print('Discarding invalid video {}'.format(filename))
-
-                input_movie.release()
-                cv2.destroyAllWindows()
-
-    """
-    Preprocesses training files
-    -----------------------------------------------------------
-    split: set to 1
-    """
-    def handle_train_files(self, split):
-        print('Preprocessing training files')
-        print("Looking for raw videos")
-        if len(os.listdir(constants.RAW_DEEPFAKES)) == 2:
-            print('No New Raw Videos Found!')
-        else:
-            start_time = time.time()
-            subprocess.call("chmod +x {}rename.sh".format(constants.RAW_DEEPFAKES), shell=True)
-            subprocess.call("sh {}rename.sh {}".format(constants.RAW_DEEPFAKES, constants.RAW_DEEPFAKES), shell=True)
-            self.split_raw_videos(1, constants.RAW_DEEPFAKES, constants.TRAIN_FPS_DEEPFAKES , constants.TRAIN_DEEPFAKES, split)
-            utilities.clear_folder(constants.TRAIN_FPS_DEEPFAKES)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking for videos to crop')
-        if len(os.listdir(constants.TRAIN_DEEPFAKES)) == 0:
-            print('Can\'t find videos to crop!')
-        else:
-            utilities.get_frame_values(constants.TRAIN_DEEPFAKES)
-            utilities.get_frame_values(constants.TRAIN_FPS_DEEPFAKES)
-
-            start_time = time.time()
-            self.crop_videos(constants.TRAIN_DEEPFAKES, constants.TRAIN_SEPARATED_DF_FACES, 20, 100, 20)
-            utilities.clear_folder(constants.TRAIN_DEEPFAKES)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking to extract motion vectors')
-        if len(os.listdir(constants.TRAIN_SEPARATED_DF_FACES)) == 0:
-            print('Can\'t find videos to extract motion vectors from!')
-        else:
-            start_time = time.time()
-            self.motion_vector_extraction(constants.TRAIN_SEPARATED_DF_FACES, constants.TRAIN_MV_DF_FACES, 20, 50)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print("Looking for raw videos")
-        if len(os.listdir(constants.RAW_REAL)) == 2:
-            print('No Raw Videos Found!')
-        else:
-            start_time = time.time()
-            subprocess.call("chmod +x {}rename.sh".format(constants.RAW_REAL), shell=True)
-            subprocess.call("sh {}rename.sh {}".format(constants.RAW_REAL, constants.RAW_REAL), shell=True)
-            self.split_raw_videos(1, constants.RAW_REAL, constants.TRAIN_FPS_REAL , constants.TRAIN_REAL, split)
-            utilities.clear_folder(constants.TRAIN_FPS_REAL)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking for videos to crop')
-        if len(os.listdir(constants.TRAIN_REAL)) == 0:
-            print('Can\'t find videos to crop!')
-        else:
-            utilities.get_frame_values(constants.TRAIN_REAL)
-            utilities.get_frame_values(constants.TRAIN_FPS_REAL)
-
-            start_time = time.time()
-            self.crop_videos(constants.TRAIN_REAL, constants.TRAIN_SEPARATED_REAL_FACES, 20, 100, 20)
-            utilities.clear_folder(constants.TRAIN_REAL)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking to extract motion vectors')
-        if len(os.listdir(constants.TRAIN_SEPARATED_REAL_FACES)) == 0:
-            print('Can\'t find videos to extract motion vectors from!')
-        else:
-            start_time = time.time()
-            self.motion_vector_extraction(constants.TRAIN_SEPARATED_REAL_FACES, constants.TRAIN_MV_REAL_FACES, 20, 50)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-    """
-    Preprocesses testing files
-    -----------------------------------------------------------
-    split: set to 2
-    """
-    def handle_test_files(self, split):
-        print('Preprocessing videos for testing')
-        print("Looking for raw videos")
-        if len(os.listdir(constants.TEST_RAW_DEEPFAKES)) == 2:
-            print('No New Raw Videos Found!')
-        else:
-            start_time = time.time()
-            subprocess.call("chmod +x {}rename.sh".format(constants.TEST_RAW_DEEPFAKES), shell=True)
-            subprocess.call("sh {}rename.sh {}".format(constants.TEST_RAW_DEEPFAKES, constants.TEST_RAW_DEEPFAKES), shell=True)
-            self.split_raw_videos(1, constants.TEST_RAW_DEEPFAKES, constants.TEST_FPS_DEEPFAKES , constants.TEST_DEEPFAKES, split)
-            utilities.clear_folder(constants.TEST_FPS_DEEPFAKES)
-
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking for videos to crop')
-        if len(os.listdir(constants.TEST_DEEPFAKES)) == 0:
-            print('Can\'t find videos to crop!')
-        else:
-            utilities.get_frame_values(constants.TEST_DEEPFAKES)
-            utilities.get_frame_values(constants.TEST_FPS_DEEPFAKES)
-
-            start_time = time.time()
-            self.crop_videos(constants.TEST_DEEPFAKES, constants.TEST_SEPARATED_DF_FACES, 20, 100, 20)
-            utilities.clear_folder(constants.TEST_DEEPFAKES)
-
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking to extract motion vectors')
-        if len(os.listdir(constants.TEST_SEPARATED_DF_FACES)) == 0:
-            print('Can\'t find videos to extract motion vectors from!')
-        else:
-            start_time = time.time()
-            self.motion_vector_extraction(constants.TEST_SEPARATED_DF_FACES, constants.TEST_MV_DF_FACES, 20, 50)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print("Looking for raw videos")
-        if len(os.listdir(constants.TEST_RAW_REAL)) == 2:
-            print('No Raw Videos Found!')
-        else:
-            start_time = time.time()
-            subprocess.call("chmod +x {}rename.sh".format(constants.TEST_RAW_REAL), shell=True)
-            subprocess.call("sh {}rename.sh {}".format(constants.TEST_RAW_REAL, constants.TEST_RAW_REAL), shell=True)
-            self.split_raw_videos(1, constants.TEST_RAW_REAL, constants.TEST_FPS_REAL , constants.TEST_REAL, split)
-            utilities.clear_folder(constants.TEST_FPS_REAL)
-
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking for videos to crop')
-        if len(os.listdir(constants.TEST_REAL)) == 0:
-            print('Can\'t find videos to crop!')
-        else:
-            utilities.get_frame_values(constants.TEST_REAL)
-            utilities.get_frame_values(constants.TEST_FPS_REAL)
-
-            start_time = time.time()
-            self.crop_videos(constants.TEST_REAL, constants.TEST_SEPARATED_REAL_FACES, 20, 100, 20)
-            utilities.clear_folder(constants.TEST_REAL)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking to extract motion vectors')
-        if len(os.listdir(constants.TEST_SEPARATED_REAL_FACES)) == 0:
-            print('Can\'t find videos to extract motion vectors from!')
-        else:
-            start_time = time.time()
-            self.motion_vector_extraction(constants.TEST_SEPARATED_REAL_FACES, constants.TEST_MV_REAL_FACES, 20, 50)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-    """
-    Preprocesses unknown files
-    -----------------------------------------------------------
-    split: set to 3
-    """
-    def handle_unknown_files(self, split):
-        print('Preprocessing files to classify')
-        print('Looking for raw videos')
-        if len(os.listdir(constants.UNKNOWN_RAW)) == 1:
-            print('No Raw Videos Found!')
-        else:
-            start_time = time.time()
-            subprocess.call("chmod +x {}rename.sh".format(constants.UNKNOWN_RAW), shell=True)
-            subprocess.call("sh {}rename.sh {}".format(constants.UNKNOWN_RAW, constants.UNKNOWN_RAW), shell=True)
-            self.split_raw_videos(1, constants.UNKNOWN_RAW, constants.UNKNOWN_FPS , constants.UNKNOWN_CLIPS, split)
-            print('Clearing folders')
-            utilities.clear_folder(constants.UNKNOWN_FPS)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
-
-        print('Looking for videos to crop')
-        if len(os.listdir(constants.UNKNOWN_CLIPS)) == 0:
-            print('Can\'t find videos to crop!')
-        else:
-            utilities.get_frame_values(constants.UNKNOWN_CLIPS)
-            utilities.get_frame_values(constants.UNKNOWN_FPS)
-
-            start_time = time.time()
-            self.crop_videos(constants.UNKNOWN_CLIPS, constants.UNKNOWN_SEP, 20, 100, 20)
-            utilities.clear_folder(constants.UNKNOWN_CLIPS)
-            time_taken = round(((time.time() - start_time) / 60.0), 2)
-            print("--- Completed in {} minutes ---".format(time_taken))
+# Main execution block for direct script usage
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Thirdeye preprocessing module')
+    parser.add_argument('--split', type=int, choices=[1, 2, 3], default=1,
+                       help='Data split to process: 1=training, 2=testing, 3=unknown')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                       help='Path to configuration file')
+    
+    args = parser.parse_args()
+    
+    preprocessor = Preprocessor(args.config)
+    success = preprocessor.preprocess(args.split)
+    
+    if success:
+        logger.info(f"Preprocessing completed successfully for split {args.split}")
+    else:
+        logger.error(f"Preprocessing failed for split {args.split}")
