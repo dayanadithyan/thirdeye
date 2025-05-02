@@ -1,0 +1,137 @@
+data_paths:
+  base_dir: './Data/'
+  figures_dir: './Figures/'
+  models_dir: './Saved_Models/'
+
+preprocessing:
+  face_box_bias: 20
+  face_box_size: 100
+  frames_per_clip: 20
+  fps: 20
+  clip_duration: 1
+  batch_size: 32
+
+model:
+  learning_rate: 0.001
+  epochs: 20
+  batch_size: 32
+  validation_split: 0.2
+  l2_regularization: 0.001
+  dropout_rate: 0.4
+
+splits:
+  train:
+    real_raw: './Data/TRAIN/REAL_RAW/'
+    deepfake_raw: './Data/TRAIN/DF_RAW/'
+    real_fps: './Data/TRAIN/REAL_RAW/FPS/'
+    deepfake_fps: './Data/TRAIN/DF_RAW/FPS/'
+    real_clips: './Data/TRAIN/REAL_CLIPS/'
+    deepfake_clips: './Data/TRAIN/DF_CLIPS/'
+    real_faces: './Data/TRAIN/REAL_SAMPLES/'
+    deepfake_faces: './Data/TRAIN/DF_SAMPLES/'
+    real_mv: './Data/TRAIN/REAL_MV/'
+    deepfake_mv: './Data/TRAIN/DF_MV/'
+  test:
+    real_raw: './Data/TEST/REAL_RAW/'
+    deepfake_raw: './Data/TEST/DF_RAW/'
+    real_fps: './Data/TEST/REAL_RAW/FPS/'
+    deepfake_fps: './Data/TEST/DF_RAW/FPS/'
+    real_clips: './Data/TEST/REAL_CLIPS/'
+    deepfake_clips: './Data/TEST/DF_CLIPS/'
+    real_faces: './Data/TEST/REAL_SAMPLES/'
+    deepfake_faces: './Data/TEST/DF_SAMPLES/'
+    real_mv: './Data/TEST/REAL_MV/'
+    deepfake_mv: './Data/TEST/DF_MV/'
+  unknown:
+    raw: './Data/UNKNOWN/UNKNOWN_RAW/'
+    fps: './Data/UNKNOWN/UNKNOWN_FPS/'
+    clips: './Data/UNKNOWN/UNKNOWN_CLIPS/'
+    faces: './Data/UNKNOWN/UNKNOWN_SAMPLES/'
+
+networks:
+  providence_v1:
+    filters1: 8
+    filters2: 16
+    conv2: true
+    conv4: true
+    nodes_1: 2048
+    nodes_2: 512
+    leaky: false
+    epochs: 10
+  providence_v2:
+    filters1: 8
+    filters2: 16
+    conv2: true
+    conv4: true
+    nodes_1: 256
+    nodes_2: 128
+    leaky: false
+    epochs: 10
+  odin_v1:
+    filters1: 8
+    filters2: 16
+    conv2: true
+    conv4: false
+    nodes_1: 32
+    nodes_2: 16
+    leaky: false
+    epochs: 10
+  odin_v2:
+    filters1: 8
+    filters2: 16
+    conv2: true
+    conv4: false
+    nodes_1: 32
+    nodes_2: 16
+    leaky: true
+    epochs: 25
+  horus:
+    filters1: 16
+    filters2: 16
+    conv2: false
+    conv4: false
+    nodes_1: 32
+    nodes_2: 16
+    leaky: false
+    epochs: 20
+  resnet3d_18:
+    depth: 18
+    filters: [64, 128, 256, 512]
+    blocks: [2, 2, 2, 2]
+    bottleneck: false
+    learning_rate: 0.001
+    epochs: 20
+  resnet3d_34:
+    depth: 34
+    filters: [64, 128, 256, 512]
+    blocks: [3, 4, 6, 3]
+    bottleneck: false
+    learning_rate: 0.001
+    epochs: 20
+  resnet3d_50:
+    depth: 50
+    filters: [64, 128, 256, 512]
+    blocks: [3, 4, 6, 3]
+    bottleneck: true
+    learning_rate: 0.0001
+    epochs: 25
+  slowfast:
+    alpha: 8
+    beta: 0.125
+    learning_rate: 0.0001
+    epochs: 25
+  efficient3d:
+    width_coefficient: 1.0
+    depth_coefficient: 1.0
+    dropout_rate: 0.2
+    learning_rate: 0.0001
+    epochs: 30
+  vivit:
+    num_heads: 8
+    num_layers: 12
+    embed_dim: 768
+    mlp_dim: 3072
+    dropout_rate: 0.1
+    patch_size: [2, 16, 16]
+    learning_rate: 0.0001
+    epochs: 25
